@@ -103,13 +103,14 @@ async function getClient(barracaId) {
     clientData.status = 'ready';
     clientData.qrCode = null;
 
-    client.info.then(info => {
+    const info = client.info;
+    if (info) {
       clientData.session = {
         number: info.wid.user,
         name: info.pushname || 'WhatsApp Business',
         platform: info.platform
       };
-    });
+    }
   });
 
   client.on('authenticated', () => {
