@@ -167,6 +167,7 @@ app.get('/api/status', async (req, res) => {
   const clientData = await getClient(barracaId);
   res.json({
     status: clientData.status,
+    whatsappReady: clientData.status === 'ready',
     qrCode: clientData.qrCode,
     session: clientData.session,
     timestamp: new Date().toISOString()
