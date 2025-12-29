@@ -157,7 +157,11 @@ app.get('/health', (req, res) => {
 app.get('/api/status', async (req, res) => {
   const { barracaId } = req.query;
   if (!barracaId) {
-    return res.status(400).json({ success: false, message: 'barracaId é obrigatório' });
+    // Retornar 200 para o healthcheck do Railway não falhar
+    return res.status(200).json({
+      success: true,
+      message: 'WhatsApp Server is running. barracaId is required for specific status.'
+    });
   }
 
   const clientData = await getClient(barracaId);
