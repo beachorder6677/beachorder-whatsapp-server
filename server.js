@@ -7,8 +7,39 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
-app.use(cors());
+// Configurar origens permitidas para CORS
+const allowedOrigins = [
+  process.env.CORS_ORIGIN,
+  process.env.CORS_ORIGIN2,
+  process.env.CORS_ORIGIN3,
+  process.env.CORS_ORIGIN4,
+  'http://localhost:5173',
+  'http://localhost:3000'
+].filter(Boolean); // Remove valores undefined/null
+
+console.log('🔒 [CORS] Origens permitidas:', allowedOrigins);
+
+// Middleware CORS com múltiplas origens
+app.use(cors({
+  origin: function (origin, callback) {
+    // Permite requests sem origin (ex: REST clients, mobile apps)
+    if (!origin) return callback(null, true);
+
+    // Verifica se a origem contém .mgx.dev ou .mgx.world (aceita todos subdomínios)
+    if (origin.includes('.mgx.dev') || origin.includes('.mgx.world') || origin.includes('localhost')) {
+      return callback(null, true);
+    }
+
+    // Verifica se está na lista de origens permitidas
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    console.warn('⚠️ [CORS] Origem bloqueada:', origin);
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -184,7 +215,7 @@ app.post('/api/send-bulk-message', async (req, res) => {
 
         // Enviar mensagem
         const sentMessage = await client.sendMessage(formattedNumber, message);
-        
+
         results.push({
           number: number,
           success: true,
