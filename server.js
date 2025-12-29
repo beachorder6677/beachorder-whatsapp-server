@@ -33,19 +33,30 @@ app.use((req, res, next) => {
   next();
 });
 
-// Estado do WhatsApp
-let whatsappClient = null;
-let qrCodeData = null;
-let clientStatus = 'disconnected';
-let sessionData = null;
+// Estado do WhatsApp (Multi-tenant)
+const clients = new Map();
 
-// Inicializar cliente WhatsApp
-function initializeWhatsApp() {
-  console.log('🚀 Inicializando cliente WhatsApp...');
-  
-  whatsappClient = new Client({
+// Função para obter ou criar um cliente para uma barraca
+async function getClient(barracaId) {
+  if (!barracaId) return null;
+
+  if (clients.has(barracaId)) {
+    return clients.get(barracaId);
+  }
+
+  console.log(`🚀 Inicializando novo cliente WhatsApp para barraca: ${barracaId}`);
+
+  const clientData = {
+    client: null,
+    qrCode: null,
+    status: 'disconnected',
+    session: null
+  };
+
+  const client = new Client({
     authStrategy: new LocalAuth({
-      dataPath: './whatsapp-session'
+      clientId: barracaId,
+      dataPath: './whatsapp-sessions'
     }),
     puppeteer: {
       headless: true,
@@ -53,98 +64,112 @@ function initializeWhatsApp() {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
         '--no-zygote',
-        '--single-process',
         '--disable-gpu'
       ]
     }
   });
 
-  whatsappClient.on('qr', async (qr) => {
-    console.log('📱 QR Code gerado');
+  client.on('qr', async (qr) => {
+    console.log(`📱 QR Code gerado para ${barracaId}`);
     try {
-      qrCodeData = await qrcode.toDataURL(qr);
-      clientStatus = 'qr_ready';
-      console.log('✅ QR Code convertido para base64');
+      clientData.qrCode = await qrcode.toDataURL(qr);
+      clientData.status = 'qr_ready';
     } catch (error) {
-      console.error('❌ Erro ao gerar QR code:', error);
+      console.error(`❌ Erro ao gerar QR code para ${barracaId}:`, error);
     }
   });
 
-  whatsappClient.on('ready', () => {
-    console.log('✅ WhatsApp conectado e pronto!');
-    clientStatus = 'ready';
-    qrCodeData = null;
-    
-    // Obter informações da sessão
-    whatsappClient.info.then(info => {
-      sessionData = {
+  client.on('ready', () => {
+    console.log(`✅ WhatsApp conectado para barraca: ${barracaId}`);
+    clientData.status = 'ready';
+    clientData.qrCode = null;
+
+    client.info.then(info => {
+      clientData.session = {
         number: info.wid.user,
         name: info.pushname || 'WhatsApp Business',
         platform: info.platform
       };
-      console.log('📱 Sessão ativa:', sessionData);
     });
   });
 
-  whatsappClient.on('authenticated', () => {
-    console.log('🔐 WhatsApp autenticado');
-    clientStatus = 'authenticated';
+  client.on('authenticated', () => {
+    clientData.status = 'authenticated';
   });
 
-  whatsappClient.on('auth_failure', (msg) => {
-    console.error('❌ Falha na autenticação:', msg);
-    clientStatus = 'auth_failure';
-    qrCodeData = null;
+  client.on('auth_failure', () => {
+    clientData.status = 'auth_failure';
+    clientData.qrCode = null;
   });
 
-  whatsappClient.on('disconnected', (reason) => {
-    console.log('🔌 WhatsApp desconectado:', reason);
-    clientStatus = 'disconnected';
-    qrCodeData = null;
-    sessionData = null;
+  client.on('disconnected', () => {
+    clientData.status = 'disconnected';
+    clientData.qrCode = null;
+    clientData.session = null;
+    clients.delete(barracaId);
   });
 
-  // Inicializar
-  whatsappClient.initialize();
+  clientData.client = client;
+  clients.set(barracaId, clientData);
+
+  client.initialize().catch(err => {
+    console.error(`❌ Erve ao inicializar cliente ${barracaId}:`, err);
+    clients.delete(barracaId);
+  });
+
+  return clientData;
 }
 
 // Rotas da API
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     timestamp: new Date().toISOString(),
-    whatsapp_status: clientStatus 
+    whatsapp_sessions: {
+      total: clients.size,
+      active: Array.from(clients.entries()).map(([id, data]) => ({ id, status: data.status }))
+    }
   });
 });
 
 // Status do WhatsApp
-app.get('/api/status', (req, res) => {
+app.get('/api/status', async (req, res) => {
+  const { barracaId } = req.query;
+  if (!barracaId) {
+    return res.status(400).json({ success: false, message: 'barracaId é obrigatório' });
+  }
+
+  const clientData = await getClient(barracaId);
   res.json({
-    status: clientStatus,
-    qrCode: qrCodeData,
-    session: sessionData,
+    status: clientData.status,
+    qrCode: clientData.qrCode,
+    session: clientData.session,
     timestamp: new Date().toISOString()
   });
 });
 
 // Obter QR Code
-app.get('/api/qr', (req, res) => {
-  if (qrCodeData) {
+app.get('/api/qr', async (req, res) => {
+  const { barracaId } = req.query;
+  if (!barracaId) {
+    return res.status(400).json({ success: false, message: 'barracaId é obrigatório' });
+  }
+
+  const clientData = await getClient(barracaId);
+  if (clientData.qrCode) {
     res.json({
       success: true,
-      qrCode: qrCodeData,
-      status: clientStatus
+      qrCode: clientData.qrCode,
+      status: clientData.status
     });
   } else {
     res.json({
       success: false,
       message: 'QR Code não disponível',
-      status: clientStatus
+      status: clientData.status
     });
   }
 });
@@ -152,15 +177,17 @@ app.get('/api/qr', (req, res) => {
 // Desconectar WhatsApp
 app.post('/api/disconnect', async (req, res) => {
   try {
-    if (whatsappClient) {
-      await whatsappClient.destroy();
-      whatsappClient = null;
+    const { barracaId } = req.body;
+    if (!barracaId) {
+      return res.status(400).json({ success: false, message: 'barracaId é obrigatório' });
     }
-    
-    clientStatus = 'disconnected';
-    qrCodeData = null;
-    sessionData = null;
-    
+
+    const clientData = clients.get(barracaId);
+    if (clientData && clientData.client) {
+      await clientData.client.destroy();
+      clients.delete(barracaId);
+    }
+
     res.json({
       success: true,
       message: 'WhatsApp desconectado com sucesso'
@@ -176,16 +203,23 @@ app.post('/api/disconnect', async (req, res) => {
 });
 
 // Reinicializar conexão
-app.post('/api/reconnect', (req, res) => {
+app.post('/api/reconnect', async (req, res) => {
   try {
-    if (whatsappClient) {
-      whatsappClient.destroy();
+    const { barracaId } = req.body;
+    if (!barracaId) {
+      return res.status(400).json({ success: false, message: 'barracaId é obrigatório' });
     }
-    
+
+    const clientData = clients.get(barracaId);
+    if (clientData && clientData.client) {
+      await clientData.client.destroy();
+      clients.delete(barracaId);
+    }
+
     setTimeout(() => {
-      initializeWhatsApp();
+      getClient(barracaId);
     }, 2000);
-    
+
     res.json({
       success: true,
       message: 'Reinicializando conexão WhatsApp...'
@@ -203,33 +237,35 @@ app.post('/api/reconnect', (req, res) => {
 // Enviar mensagem individual
 app.post('/api/send-message', async (req, res) => {
   try {
-    const { phone, message } = req.body;
+    const { phone, message, barracaId } = req.body;
 
-    if (!phone || !message) {
+    if (!barracaId || !phone || !message) {
       return res.status(400).json({
         success: false,
-        message: 'Telefone e mensagem são obrigatórios'
+        message: 'barracaId, telefone e mensagem são obrigatórios'
       });
     }
 
-    if (clientStatus !== 'ready') {
+    const clientData = await getClient(barracaId);
+
+    if (clientData.status !== 'ready') {
       return res.status(400).json({
         success: false,
-        message: `WhatsApp não está conectado. Status: ${clientStatus}`
+        message: `WhatsApp não está conectado para a barraca ${barracaId}. Status: ${clientData.status}`
       });
     }
 
-    // Formatar número (remover caracteres especiais e adicionar código do país se necessário)
+    // Formatar número
     let formattedPhone = phone.replace(/\D/g, '');
     if (!formattedPhone.startsWith('55')) {
       formattedPhone = '55' + formattedPhone;
     }
     formattedPhone += '@c.us';
 
-    console.log(`📤 Enviando mensagem para ${formattedPhone}: ${message}`);
+    console.log(`📤 [${barracaId}] Enviando mensagem para ${formattedPhone}`);
 
-    const result = await whatsappClient.sendMessage(formattedPhone, message);
-    
+    const result = await clientData.client.sendMessage(formattedPhone, message);
+
     res.json({
       success: true,
       message: 'Mensagem enviada com sucesso',
@@ -250,12 +286,12 @@ app.post('/api/send-message', async (req, res) => {
 // Enviar mensagem em massa
 app.post('/api/send-bulk', async (req, res) => {
   try {
-    const { phones, message, delay = 2000 } = req.body;
+    const { phones, message, barracaId, delay = 2000 } = req.body;
 
-    if (!phones || !Array.isArray(phones) || phones.length === 0) {
+    if (!barracaId || !phones || !Array.isArray(phones) || phones.length === 0) {
       return res.status(400).json({
         success: false,
-        message: 'Lista de telefones é obrigatória'
+        message: 'barracaId e lista de telefones são obrigatórios'
       });
     }
 
@@ -266,18 +302,20 @@ app.post('/api/send-bulk', async (req, res) => {
       });
     }
 
-    if (clientStatus !== 'ready') {
+    const clientData = await getClient(barracaId);
+
+    if (clientData.status !== 'ready') {
       return res.status(400).json({
         success: false,
-        message: `WhatsApp não está conectado. Status: ${clientStatus}`
+        message: `WhatsApp não está conectado para a barraca ${barracaId}. Status: ${clientData.status}`
       });
     }
 
     const results = [];
-    
+
     for (let i = 0; i < phones.length; i++) {
       const phone = phones[i];
-      
+
       try {
         // Formatar número
         let formattedPhone = phone.replace(/\D/g, '');
@@ -286,10 +324,10 @@ app.post('/api/send-bulk', async (req, res) => {
         }
         formattedPhone += '@c.us';
 
-        console.log(`📤 [${i+1}/${phones.length}] Enviando para ${formattedPhone}`);
+        console.log(`📤 [${barracaId}] [${i + 1}/${phones.length}] Enviando para ${formattedPhone}`);
 
-        const result = await whatsappClient.sendMessage(formattedPhone, message);
-        
+        const result = await clientData.client.sendMessage(formattedPhone, message);
+
         results.push({
           phone: phone,
           success: true,
@@ -347,29 +385,24 @@ app.use((error, req, res, next) => {
 
 // Inicializar servidor
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor WhatsApp rodando na porta ${PORT}`);
+  console.log(`🚀 Servidor WhatsApp Multi-tenant rodando na porta ${PORT}`);
   console.log(`🌍 Ambiente: ${process.env.NODE_ENV || 'development'}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
-  
-  // Inicializar WhatsApp após 3 segundos
-  setTimeout(() => {
-    initializeWhatsApp();
-  }, 3000);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('🔄 Recebido SIGTERM, fechando servidor...');
-  if (whatsappClient) {
-    await whatsappClient.destroy();
+  for (const [id, data] of clients) {
+    if (data.client) await data.client.destroy();
   }
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
   console.log('🔄 Recebido SIGINT, fechando servidor...');
-  if (whatsappClient) {
-    await whatsappClient.destroy();
+  for (const [id, data] of clients) {
+    if (data.client) await data.client.destroy();
   }
   process.exit(0);
 });
