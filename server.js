@@ -8,23 +8,41 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Configuração CORS mais permissiva para desenvolvimento
-const corsOptions = {
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:3000',
-    'https://praiabar.mgx.world',
-    /^https:\/\/.*\.mgx\.dev$/,
-    /^https:\/\/.*\.app\.mgx\.dev$/,
-    /^https:\/\/.*-preview\.app\.mgx\.dev$/
-  ],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-  credentials: true,
-  optionsSuccessStatus: 200
-};
+// Configurar origens permitidas para CORS
+const allowedOrigins = [
+  process.env.CORS_ORIGIN,
+  process.env.CORS_ORIGIN2,
+  process.env.CORS_ORIGIN3,
+  process.env.CORS_ORIGIN4,
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'https://praiabar.mgx.world'
+].filter(Boolean); // Remove valores undefined/null
 
-app.use(cors(corsOptions));
+console.log('🔒 [CORS] Origens permitidas:', allowedOrigins);
+
+// Middleware CORS com múltiplas origens e suporte a subdomínios dinâmicos
+app.use(cors({
+  origin: function (origin, callback) {
+    // Permite requests sem origin (ex: REST clients, mobile apps)
+    if (!origin) return callback(null, true);
+
+    // Verifica se a origem contém .mgx.dev ou .mgx.world ou é localhost
+    if (origin.includes('.mgx.dev') || origin.includes('.mgx.world') || origin.includes('localhost')) {
+      return callback(null, true);
+    }
+
+    // Verifica se está na lista de origens permitidas
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    console.warn('⚠️ [CORS] Origem bloqueada:', origin);
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true
+}));
+
 app.use(express.json());
 
 // Middleware de logging
@@ -114,7 +132,7 @@ async function getClient(barracaId) {
   clients.set(barracaId, clientData);
 
   client.initialize().catch(err => {
-    console.error(`❌ Erve ao inicializar cliente ${barracaId}:`, err);
+    console.error(`❌ Erro ao inicializar cliente ${barracaId}:`, err);
     clients.delete(barracaId);
   });
 
