@@ -1,7 +1,8 @@
 const express = require('express');
 const cors = require('cors');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
 
@@ -16,28 +17,31 @@ const allowedOrigins = [
   process.env.CORS_ORIGIN4,
   'http://localhost:5173',
   'http://localhost:3000',
-  'https://praiabar.atoms.world'
-].filter(Boolean); // Remove valores undefined/null
+  'http://localhost:3001',
+  'https://praiabar.mgx.world',
+  'https://praiabar.atoms.world',
+  'https://praiabar.atoms.dev',
+  'https://mineirinho.atoms.world',
+  'https://mineirinho.atoms.dev',
+  'https://beachorder.atoms.dev'
+].filter(Boolean);
 
 console.log('🔒 [CORS] Origens permitidas:', allowedOrigins);
 
-// Middleware CORS com múltiplas origens e suporte a subdomínios dinâmicos
+// Middleware CORS
 app.use(cors({
   origin: function (origin, callback) {
-    // Permite requests sem origin (ex: REST clients, mobile apps)
     if (!origin) return callback(null, true);
-
-    // Verifica se a origem contém .atoms.dev, .atoms.world, .mgx.dev ou .mgx.world ou é localhost
-    // ✅ MIGRAÇÃO: Adicionado atoms.dev e atoms.world (novo domínio da plataforma)
-    if (origin.includes('.atoms.dev') || origin.includes('.atoms.world') || origin.includes('.mgx.dev') || origin.includes('.mgx.world') || origin.includes('localhost')) {
+    if (origin.includes('.mgx.dev') ||
+      origin.includes('.mgx.world') ||
+      origin.includes('.atoms.dev') ||
+      origin.includes('.atoms.world') ||
+      origin.includes('localhost')) {
       return callback(null, true);
     }
-
-    // Verifica se está na lista de origens permitidas
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
-
     console.warn('⚠️ [CORS] Origem bloqueada:', origin);
     callback(new Error('Not allowed by CORS'));
   },
@@ -55,6 +59,9 @@ app.use((req, res, next) => {
 // Estado do WhatsApp (Multi-tenant)
 const clients = new Map();
 
+// Logger silencioso para Baileys
+const logger = pino({ level: 'silent' });
+
 // Função para obter ou criar um cliente para uma barraca
 async function getClient(barracaId) {
   if (!barracaId) return null;
@@ -63,81 +70,130 @@ async function getClient(barracaId) {
     return clients.get(barracaId);
   }
 
-  console.log(`🚀 Inicializando novo cliente WhatsApp para barraca: ${barracaId}`);
+  console.log(`🚀 Inicializando novo cliente WhatsApp (Baileys) para: ${barracaId}`);
 
   const clientData = {
-    client: null,
+    socket: null,
     qrCode: null,
     status: 'disconnected',
     session: null
   };
 
-  const client = new Client({
-    authStrategy: new LocalAuth({
-      clientId: barracaId,
-      dataPath: './whatsapp-sessions'
-    }),
-    puppeteer: {
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--no-zygote',
-        '--disable-gpu'
-      ]
-    }
-  });
-
-  client.on('qr', async (qr) => {
-    console.log(`📱 QR Code gerado para ${barracaId}`);
-    try {
-      clientData.qrCode = await qrcode.toDataURL(qr);
-      clientData.status = 'qr_ready';
-    } catch (error) {
-      console.error(`❌ Erro ao gerar QR code para ${barracaId}:`, error);
-    }
-  });
-
-  client.on('ready', () => {
-    console.log(`✅ WhatsApp conectado para barraca: ${barracaId}`);
-    clientData.status = 'ready';
-    clientData.qrCode = null;
-
-    client.info.then(info => {
-      clientData.session = {
-        number: info.wid.user,
-        name: info.pushname || 'WhatsApp Business',
-        platform: info.platform
-      };
-    });
-  });
-
-  client.on('authenticated', () => {
-    clientData.status = 'authenticated';
-  });
-
-  client.on('auth_failure', () => {
-    clientData.status = 'auth_failure';
-    clientData.qrCode = null;
-  });
-
-  client.on('disconnected', () => {
-    clientData.status = 'disconnected';
-    clientData.qrCode = null;
-    clientData.session = null;
-    clients.delete(barracaId);
-  });
-
-  clientData.client = client;
   clients.set(barracaId, clientData);
 
-  client.initialize().catch(err => {
-    console.error(`❌ Erro ao inicializar cliente ${barracaId}:`, err);
-    clients.delete(barracaId);
-  });
+  try {
+    await initializeSocket(barracaId, clientData);
+  } catch (error) {
+    console.error(`❌ Erro ao inicializar ${barracaId}:`, error.message);
+    clientData.status = 'initialization_error';
+  }
 
   return clientData;
+}
+
+// Inicializar socket Baileys
+async function initializeSocket(barracaId, clientData) {
+  const authDir = path.join('./whatsapp-sessions', barracaId);
+
+  // Criar diretório se não existir
+  if (!fs.existsSync(authDir)) {
+    fs.mkdirSync(authDir, { recursive: true });
+  }
+
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+  // Obter a versão mais recente do WhatsApp para evitar erro 405
+  let version;
+  try {
+    const versionInfo = await fetchLatestBaileysVersion();
+    version = versionInfo.version;
+    console.log(`📱 [${barracaId}] Usando versão WhatsApp: ${version.join('.')}`);
+  } catch (err) {
+    console.log(`⚠️ [${barracaId}] Usando versão padrão`);
+    version = [2, 3000, 1015901307]; // Versão de fallback
+  }
+
+  const socket = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: true,
+    logger: pino({ level: 'warn' }),
+    browser: ['BeachOrder', 'Safari', '1.0.0'],
+    connectTimeoutMs: 120000,
+    defaultQueryTimeoutMs: 120000,
+    keepAliveIntervalMs: 25000,
+    retryRequestDelayMs: 500,
+    emitOwnEvents: false,
+    syncFullHistory: false,
+    markOnlineOnConnect: false
+  });
+
+  clientData.socket = socket;
+
+  // Evento de conexão atualizada
+  socket.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log(`📱 QR Code gerado para ${barracaId}`);
+      try {
+        clientData.qrCode = await qrcode.toDataURL(qr);
+        clientData.status = 'qr_ready';
+      } catch (error) {
+        console.error(`❌ Erro ao gerar QR code:`, error);
+      }
+    }
+
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+      console.log(`🔌 [${barracaId}] Desconectado. Código: ${statusCode}. Reconectar: ${shouldReconnect}`);
+
+      clientData.status = 'disconnected';
+      clientData.qrCode = null;
+
+      if (shouldReconnect) {
+        // Tentar reconectar após 5 segundos
+        setTimeout(() => {
+          console.log(`🔄 [${barracaId}] Tentando reconectar...`);
+          initializeSocket(barracaId, clientData);
+        }, 5000);
+      } else {
+        // Logout - limpar sessão
+        clientData.session = null;
+        clients.delete(barracaId);
+        // Limpar arquivos de sessão
+        if (fs.existsSync(authDir)) {
+          fs.rmSync(authDir, { recursive: true, force: true });
+        }
+      }
+    }
+
+    if (connection === 'open') {
+      console.log(`✅ WhatsApp conectado para: ${barracaId}`);
+      clientData.status = 'ready';
+      clientData.qrCode = null;
+
+      // Obter informações do usuário
+      try {
+        const user = socket.user;
+        if (user) {
+          clientData.session = {
+            number: user.id.split(':')[0].split('@')[0],
+            name: user.name || 'WhatsApp Business',
+            platform: 'Baileys'
+          };
+          console.log(`📱 [${barracaId}] Conectado como: ${clientData.session.number} (${clientData.session.name})`);
+        }
+      } catch (err) {
+        console.error(`❌ [${barracaId}] Erro ao obter info:`, err.message);
+      }
+    }
+  });
+
+  // Salvar credenciais quando atualizadas
+  socket.ev.on('creds.update', saveCreds);
 }
 
 // Rotas da API
@@ -146,6 +202,7 @@ async function getClient(barracaId) {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
+    library: 'Baileys',
     timestamp: new Date().toISOString(),
     whatsapp_sessions: {
       total: clients.size,
@@ -158,10 +215,9 @@ app.get('/health', (req, res) => {
 app.get('/api/status', async (req, res) => {
   const { barracaId } = req.query;
   if (!barracaId) {
-    // Retornar 200 para o healthcheck do Railway não falhar
     return res.status(200).json({
       success: true,
-      message: 'WhatsApp Server is running. barracaId is required for specific status.'
+      message: 'WhatsApp Server (Baileys) is running. barracaId is required for specific status.'
     });
   }
 
@@ -183,16 +239,28 @@ app.get('/api/qr', async (req, res) => {
   }
 
   const clientData = await getClient(barracaId);
+
+  // Aguardar um pouco pelo QR Code se ainda não estiver pronto
+  if (!clientData.qrCode && clientData.status !== 'ready') {
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+
   if (clientData.qrCode) {
     res.json({
       success: true,
       qrCode: clientData.qrCode,
       status: clientData.status
     });
+  } else if (clientData.status === 'ready') {
+    res.json({
+      success: true,
+      message: 'WhatsApp já está conectado',
+      status: clientData.status
+    });
   } else {
     res.json({
       success: false,
-      message: 'QR Code não disponível',
+      message: 'QR Code não disponível. Aguarde...',
       status: clientData.status
     });
   }
@@ -207,8 +275,8 @@ app.post('/api/disconnect', async (req, res) => {
     }
 
     const clientData = clients.get(barracaId);
-    if (clientData && clientData.client) {
-      await clientData.client.destroy();
+    if (clientData && clientData.socket) {
+      await clientData.socket.logout();
       clients.delete(barracaId);
     }
 
@@ -234,15 +302,27 @@ app.post('/api/reconnect', async (req, res) => {
       return res.status(400).json({ success: false, message: 'barracaId é obrigatório' });
     }
 
+    // Remover cliente existente
     const clientData = clients.get(barracaId);
-    if (clientData && clientData.client) {
-      await clientData.client.destroy();
-      clients.delete(barracaId);
+    if (clientData && clientData.socket) {
+      try {
+        await clientData.socket.end();
+      } catch (e) {
+        // Ignorar erros ao fechar
+      }
+    }
+    clients.delete(barracaId);
+
+    // Limpar sessão existente
+    const authDir = path.join('./whatsapp-sessions', barracaId);
+    if (fs.existsSync(authDir)) {
+      fs.rmSync(authDir, { recursive: true, force: true });
     }
 
+    // Criar novo cliente
     setTimeout(() => {
       getClient(barracaId);
-    }, 2000);
+    }, 1000);
 
     res.json({
       success: true,
@@ -272,39 +352,29 @@ app.post('/api/send-message', async (req, res) => {
 
     const clientData = await getClient(barracaId);
 
-    // ✅ CORREÇÃO: Verificar se o client realmente existe
-    if (!clientData || !clientData.client) {
-      console.error(`❌ [${barracaId}] Cliente WhatsApp não inicializado`);
+    if (clientData.status !== 'ready' || !clientData.socket) {
       return res.status(400).json({
         success: false,
-        message: `WhatsApp não inicializado para a barraca ${barracaId}. Por favor, escaneie o QR Code novamente.`,
-        status: clientData?.status || 'not_initialized'
+        message: `WhatsApp não está conectado para ${barracaId}. Status: ${clientData.status}`
       });
     }
 
-    if (clientData.status !== 'ready') {
-      return res.status(400).json({
-        success: false,
-        message: `WhatsApp não está conectado para a barraca ${barracaId}. Status: ${clientData.status}`
-      });
-    }
-
-    // Formatar número
+    // Formatar número (Baileys usa formato diferente)
     let formattedPhone = phone.replace(/\D/g, '');
     if (!formattedPhone.startsWith('55')) {
       formattedPhone = '55' + formattedPhone;
     }
-    formattedPhone += '@c.us';
+    const jid = formattedPhone + '@s.whatsapp.net';
 
-    console.log(`📤 [${barracaId}] Enviando mensagem para ${formattedPhone}`);
+    console.log(`📤 [${barracaId}] Enviando mensagem para ${jid}`);
 
-    const result = await clientData.client.sendMessage(formattedPhone, message);
+    const result = await clientData.socket.sendMessage(jid, { text: message });
 
     res.json({
       success: true,
       message: 'Mensagem enviada com sucesso',
-      messageId: result.id.id,
-      to: formattedPhone
+      messageId: result.key.id,
+      to: jid
     });
 
   } catch (error) {
@@ -338,10 +408,10 @@ app.post('/api/send-bulk', async (req, res) => {
 
     const clientData = await getClient(barracaId);
 
-    if (clientData.status !== 'ready') {
+    if (clientData.status !== 'ready' || !clientData.socket) {
       return res.status(400).json({
         success: false,
-        message: `WhatsApp não está conectado para a barraca ${barracaId}. Status: ${clientData.status}`
+        message: `WhatsApp não está conectado para ${barracaId}. Status: ${clientData.status}`
       });
     }
 
@@ -351,24 +421,22 @@ app.post('/api/send-bulk', async (req, res) => {
       const phone = phones[i];
 
       try {
-        // Formatar número
         let formattedPhone = phone.replace(/\D/g, '');
         if (!formattedPhone.startsWith('55')) {
           formattedPhone = '55' + formattedPhone;
         }
-        formattedPhone += '@c.us';
+        const jid = formattedPhone + '@s.whatsapp.net';
 
-        console.log(`📤 [${barracaId}] [${i + 1}/${phones.length}] Enviando para ${formattedPhone}`);
+        console.log(`📤 [${barracaId}] [${i + 1}/${phones.length}] Enviando para ${jid}`);
 
-        const result = await clientData.client.sendMessage(formattedPhone, message);
+        const result = await clientData.socket.sendMessage(jid, { text: message });
 
         results.push({
           phone: phone,
           success: true,
-          messageId: result.id.id
+          messageId: result.key.id
         });
 
-        // Delay entre mensagens para evitar spam
         if (i < phones.length - 1) {
           await new Promise(resolve => setTimeout(resolve, delay));
         }
@@ -419,7 +487,7 @@ app.use((error, req, res, next) => {
 
 // Inicializar servidor
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor WhatsApp Multi-tenant rodando na porta ${PORT}`);
+  console.log(`🚀 Servidor WhatsApp (Baileys) rodando na porta ${PORT}`);
   console.log(`🌍 Ambiente: ${process.env.NODE_ENV || 'development'}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
 });
@@ -428,7 +496,11 @@ app.listen(PORT, () => {
 process.on('SIGTERM', async () => {
   console.log('🔄 Recebido SIGTERM, fechando servidor...');
   for (const [id, data] of clients) {
-    if (data.client) await data.client.destroy();
+    if (data.socket) {
+      try {
+        await data.socket.end();
+      } catch (e) { }
+    }
   }
   process.exit(0);
 });
@@ -436,7 +508,11 @@ process.on('SIGTERM', async () => {
 process.on('SIGINT', async () => {
   console.log('🔄 Recebido SIGINT, fechando servidor...');
   for (const [id, data] of clients) {
-    if (data.client) await data.client.destroy();
+    if (data.socket) {
+      try {
+        await data.socket.end();
+      } catch (e) { }
+    }
   }
   process.exit(0);
 });
